@@ -1,0 +1,93 @@
+git_creds = 'gitlab-creds'
+ImageRegistry = 'docker.io'
+ImageRepository = 'manjumaikan'
+apiBuilderImageName = 'realworld-api'
+webBuilderImageName = 'realworld-web'
+
+pipeline {
+    agent {
+        kubernetes {
+            workingDir '/tmp/jenkins'
+            yaml """
+              kind: Pod
+              metadata:
+                namespace: jenkins
+                labels:
+                  jenkins: slave
+              spec:
+                containers:
+                - name: jnlp
+                  image: jenkins/jnlp-slave
+                - name: kaniko
+                  image: gcr.io/kaniko-project/executor:debug
+                  imagePullPolicy: Always
+                  command:
+                    - /busybox/cat
+                  tty: true
+                """
+              }
+          }
+    stages {
+    stage('Checkout') {
+      steps {
+        checkoutSCM('https://github.com/manjumaikan/realworld-app.git', 'master', "${git_creds}", 'realworld-app', 'false')
+        script {
+                sh ("""
+                ls
+                """)
+          currentBuild.displayName = "realworld:${BUILD_ID}"
+          currentBuild.description = "Building components of realworld app"
+        }
+      }
+    }
+    
+    stage('Docker build api') {
+                steps{
+                    container(name: 'kaniko', shell: '/busybox/sh'){
+                        dir("${workspace}/realworld-app") {
+            withCredentials([file(credentialsId: 'DockerCredentialConfig', variable: 'dockerConfig')]) {
+            sh ('''#!/busybox/sh
+                cp $dockerConfig /kaniko/.docker/config.json
+            ''')
+          }
+          sh ("""#!/busybox/sh
+              echo "******************************* this is on the kaniko container  ********************************"
+              /kaniko/executor --context ${WORKSPACE}/realworld-app/backend/ --verbosity debug --destination ${ImageRegistry}/${ImageRepository}/${apiBuilderImageName}:${BUILD_NUMBER}
+          """)
+                        }
+                    }
+                }
+            }
+    stage('Docker build web') {
+                steps{
+                    container(name: 'kaniko', shell: '/busybox/sh'){
+                        dir("${workspace}/realworld-app") {
+        withCredentials([file(credentialsId: 'DockerCredentialConfig', variable: 'dockerConfig')]) {
+            sh ('''#!/busybox/sh
+                cp $dockerConfig /kaniko/.docker/config.json
+            ''')
+          }
+          sh ("""#!/busybox/sh
+              echo "******************************* this is on the kaniko container  ********************************"
+              /kaniko/executor --context ${WORKSPACE}/realworld-app/frontend/ --verbosity debug --destination ${ImageRegistry}/${ImageRepository}/${webBuilderImageName}:${BUILD_NUMBER}
+          """)
+                        }
+                    }
+                }
+            }
+
+          }// end of stages
+  }// end of pipeline
+
+def checkoutSCM(String repoUrl, String repoBranch, String repoCreds, String repoDir, String polling) {
+  retry(10) {
+        dir("${repoDir}") {
+      checkout changelog: Boolean.valueOf("${polling}"), poll: Boolean.valueOf("${polling}"), scm: [$class: 'GitSCM', branches: [[name: "refs/heads/${repoBranch}"]],
+                                                          doGenerateSubmoduleConfigurations: false,
+                                                          extensions: [[$class: 'CloneOption', depth: 2, noTags: true, reference: '', shallow: true, timeout: 30],
+                                                                       [$class: 'LocalBranch', localBranch: "${repoBranch}"]],
+                                                                        submoduleCfg: [],
+                                                          userRemoteConfigs: [[credentialsId: "${repoCreds}", url: "${repoUrl}"]]]
+        }
+  }
+}

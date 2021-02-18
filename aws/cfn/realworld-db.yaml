@@ -1,0 +1,309 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: db stack for the realworld application
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - Label:
+          default: 'EC2 Parameters'
+        Parameters:
+          - EnvSubCode
+      - Label:
+          default: 'Cluster Parameters'
+        Parameters:
+          - InstanceType
+          - InstanceProfile
+      - Label:
+          default: 'DNS Parameters'
+        Parameters:
+          - HostedZone          
+
+Parameters:
+  EnvSubCode:
+    Description: Which logical environment ?
+    Type: String
+    AllowedValues:
+      - ci
+      - dev
+      - st
+      - psup
+      - prod
+  InstanceType:
+    Description: 'The instance type of the EC2 instance.'
+    Type: String
+    Default: 't3.large'
+  InstanceProfile:
+    Description: 'The instance profile of the EC2 instance.'
+    Type: String
+  AMIID:
+    Description: 'AMI ID to be used for the EC2 instance'
+    Type: AWS::EC2::Image::Id
+  dockerPass:
+    Description: Docker password
+    Type: String
+    NoEcho: true
+  dockerUser:
+    Description: Docker password
+    Type: String
+    NoEcho: true
+  HostedZone:    
+    Description: 'Hosted Zone for the db stack.'
+    Type: String
+  DBUser:
+    Description: The Master username for the DB
+    Type: String
+    Default: masteruser
+  DBPassword:
+    Description: The Master password for the DB
+    Type: String
+    Default: Secret
+  MonitoringDNS:
+    Description: 'Monitoring instance DNS'
+    Type: String
+    Default: 'aws-realworld-monit-${EnvSubCode}-${HostedZone}'
+
+Resources:
+
+  SecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupName: !Sub aws-realworld-db-sg-${EnvSubCode}
+      GroupDescription: 'aws realworld db SG'
+      VpcId: !ImportValue 'vpc:vpc1'
+
+  SecurityGroupSelf:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref SecurityGroup
+      IpProtocol: tcp
+      FromPort: 0
+      ToPort: 65535
+      SourceSecurityGroupId: !Ref SecurityGroup
+
+  SecurityGroupInSSH:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref SecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: '0.0.0.0/0'
+
+  SecurityGroupMongo:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref SecurityGroup
+      IpProtocol: tcp
+      FromPort: 27017
+      ToPort: 27017
+      CidrIp: '0.0.0.0/0'
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AMIID
+      KeyName: aws-realworld-key
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      SecurityGroupIds:
+        - !Ref SecurityGroup
+      SubnetId: !ImportValue 'subnet:vpc1:application:a'
+      UserData:
+        'Fn::Base64': !Sub |
+                #!/bin/bash -ex
+                amazon-linux-extras install docker
+                yum install -y wget
+                yum install -y awscli
+                yum install -y jq
+                service docker start
+                usermod -a -G docker ec2-user
+                chkconfig docker on
+                yum install -y aws-cfn-bootstrap
+                sudo hostnamectl set-hostname aws-realworld-db-${EnvSubCode}.${HostedZone}
+                ln -s /usr/local/lib/python2.7/site-packages/cfnbootstrap /usr/lib/python2.7/site-packages/cfnbootstrap
+                sysctl -w vm.max_map_count=262144
+                echo "vm.max_map_count = 262144" >> /etc/sysctl.conf
+                cp /etc/fstab /etc/fstab.orig  
+                sudo mkfs -t xfs /dev/sdf
+                sudo mkdir /data && sudo mount /dev/sdf /data
+                echo "/dev/sdf  /data  xfs  defaults,nofail  0  2"  >> /etc/fstab   
+                docker login https://index.docker.io/v1/ -u ${dockerUser} -p ${dockerPass}
+                mkdir -p /etc/elastic/ && cat << EOF >> /etc/elastic/fluent.conf
+                 <source>
+                    @type forward
+                    port 24224
+                    bind "0.0.0.0"
+                  </source>
+                  <filter **>
+                    @type parser
+                    key_name log
+                    reserve_data true
+                    <parse>
+                      @type multi_format
+                      <pattern>
+                        format apache2
+                      </pattern>
+                      <pattern>
+                        format json
+                        time_key timestamp
+                      </pattern>
+                      <pattern>
+                        format none
+                      </pattern>
+                    </parse>
+                  </filter>
+                  <filter **>
+                    @type record_transformer
+                    enable_ruby true
+                    <record>
+                      log \${!record["log"].gsub(/\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[m|K]/, '')}
+                    </record>
+                  </filter>                  
+                  <match *.**>
+                      @type "elasticsearch"
+                      host "${MonitoringDNS}"
+                      port 9200
+                      logstash_format true
+                      logstash_prefix "fluentd"
+                      logstash_dateformat "%Y%m%d"
+                      include_tag_key true
+                      type_name "docker_log"
+                      tag_key "@log_name"
+                      flush_interval 1s
+                  </match>
+                EOF
+                docker run \
+                --volume=/etc/elastic/fluent.conf:/fluentd/etc/fluent.conf \
+                --privileged \
+                --restart=always \
+                --detach=true \
+                --publish=24224:24224 \
+                --name fluent-elastic \
+                "manjumaikan/fluent-elastic:medium"
+                docker pull mongo:3.4.11
+                docker run --name realworld-mongo \
+                  --ulimit nofile=65535:65535 \
+                  --privileged \
+                  --restart=always \
+                  --detach=true \
+                  --publish=27017:27017 \
+                  --volume=/data/db:/data/db \
+                  --volume=/data/bkp:/data_bkp \
+                  --log-driver=fluentd \
+                  --log-opt tag="docker.{{.Name}}" \
+                "mongo:3.4.11"
+                mkdir -p /etc/scripts/ && cat << EOF >> /etc/scripts/create-snapshot.sh
+                export AWS_DEFAULT_REGION=${AWS::Region}
+                aws ec2 describe-instances --region ap-southeast-2 \
+                --filters "Name=tag:Name,Values=${AWS::StackName}" | \
+                jq -r '.Reservations[].Instances[].BlockDeviceMappings[] | \
+                select (.DeviceName == "/dev/sdf") | .Ebs.VolumeId' | \
+                xargs -I{} aws ec2 create-snapshot --description "automated backup of mongodb database - Realworld app" --volume-id {} --tag-specifications \
+                'ResourceType=snapshot,Tags=[{Key=Name,Value=${AWS::StackName}},{Key=type,Value=automated-backup}]'
+                EOF
+                chmod 755 /etc/scripts/create-snapshot.sh
+                set +e
+                crontab -l > /etc/scripts/systemcron
+                cat /etc/scripts/systemcron
+                echo "30 */1 * * * /etc/scripts/create-snapshot.sh" >> /etc/scripts/systemcron
+                crontab /etc/scripts/systemcron
+                rm /etc/scripts/systemcron
+      Tags:
+        - Key: "Name"
+          Value: !Join ['-',['aws-realworld-db',!Ref EnvSubCode]]                    
+
+  dns4db:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      HostedZoneName: !Ref HostedZone
+      RecordSets:
+      - Name: !Join ['', ['aws-realworld-db', '-', !Ref 'EnvSubCode','.', !Ref HostedZone]]
+        Type: A
+        TTL: '900'
+        ResourceRecords:
+        - !GetAtt EC2Instance.PrivateIp
+
+  NewVolume:
+    Type: AWS::EC2::Volume
+    Properties:
+      Size: 25
+      AvailabilityZone: !GetAtt EC2Instance.AvailabilityZone
+    DeletionPolicy: Snapshot
+
+  MountPoint:
+    Type: AWS::EC2::VolumeAttachment
+    Properties:
+      InstanceId: !Ref EC2Instance
+      VolumeId: !Ref NewVolume
+      Device: /dev/sdf
+
+  # EBSSnapshotRule:
+  #   Type: AWS::Events::Rule
+  #   Properties:
+  #     Description: creates a daily snapshot of EBS volume (1 a.m.)
+  #     ScheduleExpression: cron(0 1 * * ? *)
+  #     State: ENABLED
+  #     Name:
+  #       Ref: AWS::StackName
+  #     Targets:
+  #     - Arn:
+  #         Fn::Join:
+  #         - ''
+  #         - - 'arn:aws:automation:'
+  #           - Ref: AWS::Region
+  #           - ":"
+  #           - Ref: AWS::AccountId
+  #           - ":action/"
+  #           - EBSCreateSnapshot/EBSCreateSnapshot_
+  #           - Ref: AWS::StackName
+  #       Input:
+  #         Fn::Join:
+  #         - ''
+  #         - - "\"arn:aws:ec2:"
+  #           - Ref: AWS::Region
+  #           - ":"
+  #           - Ref: AWS::AccountId
+  #           - ":volume/"
+  #           - Ref: NewVolume
+  #           - "\""
+  #       Id: NewVolume
+  
+  # BasicLifecyclePolicy:
+  #   Type: "AWS::DLM::LifecyclePolicy"
+  #   Properties:
+  #     Description: "Lifecycle Policy using CloudFormation"
+  #     State: "ENABLED"
+  #     ExecutionRoleArn: "arn:aws:iam::122220315313:role/retention-policy-snapshots-role"
+  #     PolicyDetails:
+  #       ResourceTypes:
+  #         - "VOLUME"
+  #       TargetTags:
+  #           - Key: "Name"
+  #             Value: !Join ['-',['aws-realworld-db',!Ref EnvSubCode, 'data-volume']]
+          
+  #       Schedules:
+  #         -
+  #           Name: "Daily Snapshots"
+  #           TagsToAdd:
+  #             -
+  #               Key: "type"
+  #               Value: "DailySnapshot"
+              
+  #           CreateRule:
+  #             Interval: 12
+  #             IntervalUnit: "HOURS"
+  #             Times:
+  #               - "13:00"
+  #           RetainRule:
+  #             Count: 7
+  #           CopyTags: true  
+
+Outputs:
+  StackName:
+    Description: 'Stack name.'
+    Value: !Sub '${AWS::StackName}'
+  DNSName:
+    Description: 'The DNS name for the db server.'
+    Value: !Join ['', ['aws-realworld-db', '-', !Ref 'EnvSubCode','.', !Ref HostedZone]]
+    Export:
+      Name: !Sub '${AWS::StackName}-DNSName'    

@@ -1,0 +1,244 @@
+#!/usr/bin/env groovy
+
+git_creds = 'gitlab-creds'
+ImageRegistry = 'docker.io'
+ImageRepository = 'manjumaikan'
+apiBuilderImageName = 'realworld-api'
+webBuilderImageName = 'realworld-web'
+AWS_DEFAULT_REGION = 'ap-southeast-2'
+
+pipeline {
+    agent {
+        kubernetes {
+            workingDir '/tmp/jenkins'
+            yaml """
+              kind: Pod
+              metadata:
+                namespace: jenkins
+                labels:
+                  jenkins: slave
+              spec:
+                containers:
+                - name: jnlp
+                  image: jenkins/jnlp-slave
+                - name: aws-cli
+                  image: jshimko/kube-tools-aws:latest
+                  tty: true
+                  env:
+                    - name: AWS_DEFAULT_REGION
+                      value: ${AWS_DEFAULT_REGION}
+                """
+              }
+          }
+        parameters {
+        string(name:'ENVIRONMENT' ,defaultValue: 'dev', description: 'deployment Environment')  
+        password(name:'DBPassword' , defaultValue: 'change_m3_aft3r_build', description: 'Enter a password')
+        booleanParam(name: 'Delete_older_versions', defaultValue: true, description: "Delete other deployed versions?")
+        extendedChoice(
+            name: 'docker_build_version', 
+            defaultValue: '', 
+            description: 'select docker build version to deploy', 
+            type: 'PT_SINGLE_SELECT', 
+            groovyScript: 
+            """
+            import jenkins.*
+            import jenkins.model.*
+            import hudson.*
+            import hudson.model.*
+
+            builds = []
+            for(String jobname : Hudson.instance.getAllItems()*.fullName.findAll { it =~ /(?i).realworld.build/ } ) {
+            job = Jenkins.getInstance().getItemByFullName(jobname)
+            builds += job.getBuilds().overThresholdOnly(Result.SUCCESS).limit(12).collect { it.displayName.replaceAll("realworld:","") }
+            }
+            return builds.sort().reverse()
+            """
+            )
+    }
+    environment {
+        //timestamp = new Date().format('yyyyMMddhhmmss')
+        workspace = pwd()
+        AWS_ACCESS_KEY_ID = credentials('AWS_ACCESS_KEY_ID')
+        AWS_SECRET_ACCESS_KEY = credentials('AWS_SECRET_ACCESS_KEY')
+        AWS_SESSION_TOKEN = credentials('AWS_SESSION_TOKEN')
+        AWS_ASSUME_ROLE = credentials('AWS_ASSUME_ROLE')
+        HOSTED_ZONE = credentials('HOSTED_ZONE')
+        ENVIRONMENT = "${ENVIRONMENT.toLowerCase()}"
+        BUILD_TO_DEPLOY = "${docker_build_version}"
+        DOCKER = credentials('DOCKER')
+        DELETE_OLDER_VERSIONS    = "${params.Delete_older_versions}"
+    }
+
+    options {
+        disableConcurrentBuilds()
+        //buildDiscarder(logRotator(numToKeepStr: '1'))
+    }
+
+    stages {
+/*
+ * STAGE: Checkout Source code from git
+ */
+
+ 
+        stage('Checkout infra') {
+                steps {
+                  checkoutSCM('https://github.com/manjumaikan/realworld-app.git', 'master', "${git_creds}", 'realworld-infra', 'false')
+                  script {
+                    currentBuild.displayName = "realworld-deploy:${ENVIRONMENT}:${BUILD_TO_DEPLOY}"
+                    currentBuild.description = "Deploying components of realworld app"
+                    }
+                  }
+                }
+
+        stage('Setup AWS Login') {
+                steps{        
+                    container(name: 'aws-cli'){
+                        dir("${workspace}/realworld-infra") {
+                            sh ('''
+                            set +x
+                            export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+                            export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+                            export AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}
+                            apk add jq
+                            aws --version
+                            aws sts get-caller-identity
+                            ''')
+                        }
+                      }
+                    }
+                  }
+
+         stage("Deploy Monitoring") {
+            steps {
+                container(name: 'aws-cli'){
+                    dir("${workspace}/realworld-infra/aws/cfn/") {
+                      sh ('''
+                            set +x
+                            CREDENTIALS=$(aws sts assume-role --role-arn ${AWS_ASSUME_ROLE} --role-session-name \"dev-iam-role\" | jq -r .Credentials)
+                            export AWS_ACCESS_KEY_ID=$(echo ${CREDENTIALS}|jq -r .AccessKeyId)
+                            export AWS_SECRET_ACCESS_KEY=$(echo ${CREDENTIALS}|jq -r .SecretAccessKey)
+                            export AWS_SESSION_TOKEN=$(echo ${CREDENTIALS}|jq -r .SessionToken)
+                            export dockerUser=$DOCKER_USR
+                            export dockerPass=$DOCKER_PSW
+                            export BUILD_TO_DEPLOY=$BUILD_TO_DEPLOY
+                            AMI_ID=`aws ec2 describe-images --region ap-southeast-2 --filters 'Name=is-public,Values=false' 'Name=name,Values=amzn*' --query 'reverse(sort_by(Images, &CreationDate))[0].ImageId' --output text`
+                            aws cloudformation deploy --template-file realworld-monitoring.yaml --stack-name aws-realworld-monit-${ENVIRONMENT} --parameter-overrides \$(cat ../env/\${ENVIRONMENT}.ini) AMIID=${AMI_ID}  dockerUser=${dockerUser} dockerPass=${dockerPass} EnvSubCode=${ENVIRONMENT} ApiStack=aws-realworld-api-${ENVIRONMENT}-${BUILD_TO_DEPLOY} WebStack=aws-realworld-web-${ENVIRONMENT}-${BUILD_TO_DEPLOY} HostedZone=${HOSTED_ZONE}. InstanceProfile=dev-learningsandpit-instanceprofile --no-fail-on-empty-changeset
+                          ''')
+                    }
+                  }
+                }
+              }
+
+        stage("Delete Old Versions") {
+          when { expression { return DELETE_OLDER_VERSIONS.toBoolean() } }
+            steps {
+              container(name: 'aws-cli'){
+                sh ('''
+          
+                ''')
+                script{
+                    try {
+                    timeout(time: 30, unit: 'MINUTES') {
+                            sh('''
+                            set +x
+                            CREDENTIALS=$(aws sts assume-role --role-arn ${AWS_ASSUME_ROLE} --role-session-name \"dev-iam-role\" | jq -r .Credentials)
+                            export AWS_ACCESS_KEY_ID=$(echo ${CREDENTIALS}|jq -r .AccessKeyId)
+                            export AWS_SECRET_ACCESS_KEY=$(echo ${CREDENTIALS}|jq -r .SecretAccessKey)
+                            export AWS_SESSION_TOKEN=$(echo ${CREDENTIALS}|jq -r .SessionToken)
+#                                let "builds2delete = $BUILD_TO_DEPLOY - 1"
+#                            set -x                  
+#                           for i in `seq 1 $builds2delete`; do
+#                              aws cloudformation delete-stack --stack-name aws-realworld-api-${ENVIRONMENT}-$i
+#                              aws cloudformation delete-stack --stack-name aws-realworld-web-${ENVIRONMENT}-$i
+#                            done
+                            for j in 'api' 'web'; do
+                                stackString=aws-realworld-$j-${ENVIRONMENT}
+                                stackName="randomValue"
+                                while [[ ! -z "$stackName" ]]; do
+                                  stackName=$(aws cloudformation describe-stacks | jq -r --arg stack $stackString '.Stacks[]|select (.StackName|contains ($stack) )|.StackName')
+#                                  echo $stackName
+                                  if [[ ! -z "$stackName" ]]; then
+                                    aws cloudformation delete-stack --stack-name $stackName
+                                  fi
+                                done
+                            done
+
+                        ''')
+                            
+                    }
+                } catch (e) {
+                    echo "${e}"
+                    //currentBuild.result = 'FAILURE'
+                }
+            }
+                }
+            }
+        }
+
+        stage("Deploy App") {
+            steps {
+                container(name: 'aws-cli'){
+                    dir("${workspace}/realworld-infra/aws/cfn/") {
+                      sh ('''
+                            set +x
+                            CREDENTIALS=$(aws sts assume-role --role-arn ${AWS_ASSUME_ROLE} --role-session-name \"dev-iam-role\" | jq -r .Credentials)
+                            export AWS_ACCESS_KEY_ID=$(echo ${CREDENTIALS}|jq -r .AccessKeyId)
+                            export AWS_SECRET_ACCESS_KEY=$(echo ${CREDENTIALS}|jq -r .SecretAccessKey)
+                            export AWS_SESSION_TOKEN=$(echo ${CREDENTIALS}|jq -r .SessionToken)
+                            export DBPassword=$DBPassword
+                            export dockerUser=$DOCKER_USR
+                            export dockerPass=$DOCKER_PSW
+                            export BUILD_TO_DEPLOY=$BUILD_TO_DEPLOY
+                            # private AMI is used in this case.
+                            AMI_ID=`aws ec2 describe-images --region ap-southeast-2 --filters 'Name=is-public,Values=false' 'Name=name,Values=amzn*' --query 'reverse(sort_by(Images, &CreationDate))[0].ImageId' --output text`
+                            aws cloudformation deploy --template-file realworld-db.yaml --stack-name aws-realworld-db-${ENVIRONMENT} --parameter-overrides \$(cat ../env/\${ENVIRONMENT}.ini) AMIID=${AMI_ID} DBPassword=${DBPassword}  dockerUser=${dockerUser} dockerPass=${dockerPass} Image=${BUILD_TO_DEPLOY} EnvSubCode=${ENVIRONMENT} MonitoringDNS=aws-realworld-monit-${ENVIRONMENT}.${HOSTED_ZONE} HostedZone=${HOSTED_ZONE}. InstanceProfile=dev-learningsandpit-instanceprofile --no-fail-on-empty-changeset
+                            aws cloudformation deploy --template-file realworld-api.yaml --stack-name aws-realworld-api-${ENVIRONMENT}-${BUILD_TO_DEPLOY} --region ap-southeast-2 --parameter-overrides \$(cat ../env/\${ENVIRONMENT}.ini) AMIID=${AMI_ID}  dockerUser=${dockerUser} dockerPass=${dockerPass} Image=${BUILD_TO_DEPLOY} EnvSubCode=${ENVIRONMENT} DatabaseStack=aws-realworld-db-${ENVIRONMENT} MonitoringDNS=aws-realworld-monit-${ENVIRONMENT}.${HOSTED_ZONE} HostedZone=${HOSTED_ZONE}. InstanceProfile=dev-learningsandpit-instanceprofile dbpass=${DBPassword} dbuser=masteruser --no-fail-on-empty-changeset
+                            aws cloudformation deploy --template-file realworld-web.yaml --stack-name aws-realworld-web-${ENVIRONMENT}-${BUILD_TO_DEPLOY} --region ap-southeast-2 --parameter-overrides \$(cat ../env/\${ENVIRONMENT}.ini) AMIID=${AMI_ID}  dockerUser=${dockerUser} dockerPass=${dockerPass} Image=${BUILD_TO_DEPLOY} EnvSubCode=${ENVIRONMENT} ApiStack=aws-realworld-api-${ENVIRONMENT}-${BUILD_TO_DEPLOY} MonitoringDNS=aws-realworld-monit-${ENVIRONMENT}.${HOSTED_ZONE} HostedZone=${HOSTED_ZONE}. InstanceProfile=dev-learningsandpit-instanceprofile --no-fail-on-empty-changeset
+                            
+                          ''')
+                          sh ('''
+                            ## update drift for api and web asgs if any
+                            set +x
+                            CREDENTIALS=$(aws sts assume-role --role-arn ${AWS_ASSUME_ROLE} --role-session-name \"dev-iam-role\" | jq -r .Credentials)
+                            export AWS_ACCESS_KEY_ID=$(echo ${CREDENTIALS} | jq -r .AccessKeyId)
+                            export AWS_SECRET_ACCESS_KEY=$(echo ${CREDENTIALS} | jq -r .SecretAccessKey)
+                            export AWS_SESSION_TOKEN=$(echo ${CREDENTIALS} | jq -r .SessionToken)
+                            for i in 'api' 'web'; do
+                                stackString=aws-realworld-$i-${ENVIRONMENT}
+                                stackName=$(aws cloudformation describe-stacks | jq -r --arg stack $stackString '.Stacks[]|select (.StackName|contains ($stack) )|.StackName')
+                                asgName=$(aws cloudformation detect-stack-resource-drift --stack-name ${stackName} --logical-resource-id AutoScalingGroup | jq -r .StackResourceDrift.PhysicalResourceId)
+                                maxSize=$(aws cloudformation detect-stack-resource-drift --stack-name ${stackName} --logical-resource-id AutoScalingGroup | jq -r '.StackResourceDrift.PropertyDifferences[] | select (.PropertyPath | contains ("MaxSize")) | .ExpectedValue')
+                                minSize=$(aws cloudformation detect-stack-resource-drift --stack-name ${stackName} --logical-resource-id AutoScalingGroup | jq -r '.StackResourceDrift.PropertyDifferences[] | select (.PropertyPath | contains ("MinSize")) | .ExpectedValue')
+                                if [[ ! -z "$minSize" || ! -z "$maxSize"  ]]; then
+                                    aws autoscaling update-auto-scaling-group --auto-scaling-group-name $asgName --min-size $minSize --max-size $maxSize
+                                fi
+                            done
+
+                            ## start dba nd monitoring servers if stopped
+                            for i in 'db' 'monit'; do
+                                instance=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=aws-realworld-$i-dev" --query 'Reservations[*].Instances[*].[InstanceId,State.Name]' --output text | grep -v terminated | sed -e 's/[[:space:]]/ /g' | cut -d ' ' -f1)
+                                state=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=aws-realworld-$i-dev" --query 'Reservations[*].Instances[*].[InstanceId,State.Name]' --output text | grep -v terminated | sed -e 's/[[:space:]]/ /g' | cut -d ' ' -f2)
+                                if [[ "$state" == "stopped" ]]; then
+                                    aws ec2 start-instances --instance-ids $instance
+                                fi
+                            done
+                            ''')   
+                    }
+                  }
+                }
+              }                            
+            }
+}
+return this;
+def checkoutSCM(String repoUrl, String repoBranch, String repoCreds, String repoDir, String polling) {
+  retry(10) {
+        dir("${repoDir}") {
+      checkout changelog: Boolean.valueOf("${polling}"), poll: Boolean.valueOf("${polling}"), scm: [$class: 'GitSCM', branches: [[name: "refs/heads/${repoBranch}"]],
+                                                          doGenerateSubmoduleConfigurations: false,
+                                                          extensions: [[$class: 'CloneOption', depth: 2, noTags: true, reference: '', shallow: true, timeout: 30],
+                                                                       [$class: 'LocalBranch', localBranch: "${repoBranch}"]],
+                                                                        submoduleCfg: [],
+                                                          userRemoteConfigs: [[credentialsId: "${repoCreds}", url: "${repoUrl}"]]]
+        }
+  }
+}
