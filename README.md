@@ -1,6 +1,14 @@
+Frontend Project:
+
+https://github.com/gothinkster/react-redux-realworld-example-app
+
+Backend Project:
+
+https://github.com/gothinkster/node-express-realworld-example-app
+
 1. Architecture Diagram:
    
-- ![alt text](images/AWS-realworld.jpeg "Architecture")
+![alt text](images/AWS-realworld.jpeg "Architecture")
 
 2. Build
 
